@@ -16,12 +16,13 @@ export function pi(root: string): Adapter {
       const found = await walk(root, ".jsonl")
       if (!found) return undefined
       files.clear()
-      return found.flatMap((file) => {
+      const sessions = found.flatMap((file) => {
         const id = file.path.match(/_([^_/]+)\.jsonl$/)?.[1]
         if (!id) return []
         files.set(id, file.path)
         return [{ id, marker: `${file.mtime}:${file.size}` }]
       })
+      return { sessions }
     },
     async load(id) {
       const path = files.get(id)

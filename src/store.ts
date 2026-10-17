@@ -60,7 +60,7 @@ export class Store {
 
   private migrate() {
     const version = this.db.query<{ user_version: number }, []>("PRAGMA user_version").get()!.user_version
-    if (version === SCHEMA_VERSION) return
+    if (version === SCHEMA_VERSION) return this.addMissing()
     this.db.transaction(() => {
       for (const table of ["session", "message", "entry", "vocab", "fts"]) this.db.run(`DROP TABLE IF EXISTS ${table}`)
       this.db.run(`CREATE TABLE session (
@@ -90,22 +90,39 @@ export class Store {
         tokenize="unicode61 remove_diacritics 0")`)
       this.db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`)
     })()
+    this.addMissing()
   }
 
-  /** Bring the index up to date with every adapter's store. Returns the number of sessions changed. */
-  async refresh(adapters: Adapter[], onProgress?: (progress: Progress) => void) {
+  // Additions that need no rebuild.
+  private addMissing() {
+    this.db.run("CREATE TABLE IF NOT EXISTS state (harness TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    const columns = this.db.query<{ name: string }, []>("PRAGMA table_info(session)").all().map((row) => row.name)
+    if (!columns.includes("open")) this.db.run("ALTER TABLE session ADD COLUMN open INTEGER")
+  }
+
+/**
+   * Bring the index up to date with every adapter's store. Returns the number of sessions read again. `full` makes
+   * adapters check everything instead of only what their shortcuts say may have changed.
+   */
+  async refresh(adapters: Adapter[], onProgress?: (progress: Progress) => void, options: { full?: boolean } = {}) {
     let changed = 0
     for (const adapter of adapters) {
-      const listing = await adapter.list()
-      if (!listing) continue
+      const state = this.db.query<{ value: string }, [string]>("SELECT value FROM state WHERE harness = ?").get(adapter.harness)?.value
+      const open = new Set(
+        this.db.query<{ id: string }, [string]>("SELECT id FROM session WHERE harness = ? AND open = 1").all(adapter.harness).map((row) => row.id),
+      )
+      const listed = await adapter.list({ state, full: options.full ?? false, open })
+      if (!listed) continue
+      const listing = listed.sessions
+      const listedIDs = new Set(listing.map((item) => item.id))
       const indexed = new Map(
         this.db
           .query<{ id: string; marker: string; num: number }, [string]>("SELECT id, marker, num FROM session WHERE harness = ?")
           .all(adapter.harness)
           .map((row) => [row.id, row]),
       )
-      const stale = listing.filter((item) => indexed.get(item.id)?.marker !== item.marker)
-      const gone = [...indexed.values()].filter((row) => !listing.some((item) => item.id === row.id))
+      const stale = listing.filter((item) => item.dirty || indexed.get(item.id)?.marker !== item.marker)
+      const gone = [...indexed.values()].filter((row) => !listedIDs.has(row.id))
       for (const row of gone) this.db.transaction(() => this.deleteSession(row.num))()
       let done = 0
       for (const item of stale) {
@@ -120,15 +137,17 @@ export class Store {
               const current = this.db
                 .query<{ num: number; marker: string }, [string, string]>("SELECT num, marker FROM session WHERE harness = ? AND id = ?")
                 .get(adapter.harness, item.id)
-              if (current?.marker === item.marker || current?.num !== num) return
+              if ((current?.marker === item.marker && !item.dirty) || current?.num !== num) return
               if (num !== undefined && !sameMarkers(this.messageMarkers(num), known)) return
-              this.write(transcript.session, transcript.messages, item.marker, num, known)
+              this.write(transcript.session, transcript.messages, item.marker, num, known, transcript.open)
             })
             .immediate()
         done++
         onProgress?.({ harness: adapter.harness, done, total: stale.length })
       }
       changed += stale.length + gone.length
+      if (listed.state !== undefined)
+        this.db.run("INSERT INTO state (harness, value) VALUES (?, ?) ON CONFLICT (harness) DO UPDATE SET value = excluded.value", [adapter.harness, listed.state])
     }
     // After a big refresh (the first one, a rebuild) merge the index segments: smaller and faster to query.
     if (changed >= 100) {
@@ -147,7 +166,7 @@ export class Store {
     )
   }
 
-  private write(info: SessionInfo, messages: (Message | Unchanged)[], marker: string, num: number | undefined, known: Map<string, string>) {
+  private write(info: SessionInfo, messages: (Message | Unchanged)[], marker: string, num: number | undefined, known: Map<string, string>, open?: boolean) {
     const session =
       num ??
       this.db
@@ -218,7 +237,7 @@ export class Store {
     for (const term of vocab) insertVocab.run(term, term[0]!, term.length)
     this.db.run(
       `UPDATE session SET title = ?, directory = ?, created = ?, updated = ?, parent = ?, archived = ?, model = ?, source = ?,
-         marker = ?, messages = (SELECT count(*) FROM message WHERE session = ?), counter = ? WHERE num = ?`,
+         marker = ?, messages = (SELECT count(*) FROM message WHERE session = ?), counter = ?, open = ? WHERE num = ?`,
       [
         info.title,
         info.directory,
@@ -231,6 +250,7 @@ export class Store {
         marker,
         session,
         counter,
+        open ? 1 : null,
         session,
       ],
     )

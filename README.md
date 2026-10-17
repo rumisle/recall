@@ -93,8 +93,11 @@ holds a copy of your transcripts, so treat it like them. Nothing leaves the mach
 
 ## How it works
 
-- **Index**: SQLite FTS5, one document per part of a message. Before each command, recall compares cheap change
-  markers (file size and time, database update times) and re-reads only changed messages, which takes milliseconds.
+- **Index**: SQLite FTS5, one document per part of a message. Before each command, recall checks cheap change
+  markers and re-reads only changed messages, which takes milliseconds. JSONL stores: file size and time. OpenCode
+  databases (often large, sometimes on a network home directory): sessions with messages created since the last
+  refresh, or mid-turn then, found through indexes without reading message rows; edits to older messages are caught
+  by a weekly full check, or `recall refresh --full`.
 - **Tokenizer**: one tokenizer for indexing, querying and highlighting, so they always agree. Each CJK character is a
   token (a CJK word is an exact phrase); identifiers also yield their parts.
 - **Ranking**: three strict tiers (all words exactly in one part; with prefixes or typos; spread over several parts),

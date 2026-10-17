@@ -19,11 +19,12 @@ export function codex(root: string): Adapter {
       const found = await walk(root, ".jsonl")
       if (!found) return undefined
       files.clear()
-      return found.map((file) => {
+      const sessions = found.map((file) => {
         const id = sessionID(file.path)
         files.set(id, file.path)
         return { id, marker: `${file.mtime}:${file.size}` }
       })
+      return { sessions }
     },
     async load(id) {
       const path = files.get(id)

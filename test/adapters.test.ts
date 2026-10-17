@@ -8,12 +8,28 @@ import { codex } from "../src/adapters/codex"
 import { opencode } from "../src/adapters/opencode"
 import { pi } from "../src/adapters/pi"
 import type { Adapter, Message, Unchanged } from "../src/model"
+import { search } from "../src/search"
+import { Store } from "../src/store"
+
+/** The tables and indexes recall uses from OpenCode 2's schema. */
+function opencodeDatabase(path: string) {
+  const db = new Database(path)
+  db.run(`CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT, time_created INTEGER,
+    time_updated INTEGER, time_archived INTEGER, model TEXT)`)
+  db.run(`CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER,
+    time_updated INTEGER, data TEXT)`)
+  db.run("CREATE UNIQUE INDEX session_message_session_seq_idx ON session_message (session_id, seq)")
+  db.run("CREATE INDEX session_message_session_type_seq_idx ON session_message (session_id, type, seq)")
+  db.run("CREATE INDEX session_message_session_time_created_id_idx ON session_message (session_id, time_created, id)")
+  db.run("CREATE INDEX session_message_time_created_idx ON session_message (time_created)")
+  return db
+}
 
 const temp = () => mkdtempSync(join(tmpdir(), "recall-"))
 const jsonl = (lines: unknown[]) => lines.map((line) => JSON.stringify(line)).join("\n") + "\n"
 
 async function loadOnly(adapter: Adapter) {
-  const listing = await adapter.list()
+  const listing = (await adapter.list({ full: false, open: new Set() }))?.sessions
   expect(listing).toHaveLength(1)
   const transcript = await adapter.load(listing![0]!.id, new Map())
   return transcript!
@@ -114,11 +130,7 @@ describe("adapters", () => {
 
   test("opencode: re-reads only changed messages", async () => {
     const path = join(temp(), "opencode.db")
-    const db = new Database(path)
-    db.run(`CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT, time_created INTEGER,
-      time_updated INTEGER, time_archived INTEGER, model TEXT)`)
-    db.run(`CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER,
-      time_updated INTEGER, data TEXT)`)
+    const db = opencodeDatabase(path)
     db.run(`INSERT INTO session_v2 VALUES ('ses_1', 'ses_0', '/work/o', 'Title', 1, 2, NULL, '{"id":"m","providerID":"p"}')`)
     const insert = db.query("INSERT INTO session_message VALUES (?, 'ses_1', ?, ?, 1, ?, ?)")
     insert.run("msg_1", "user", 0, 10, JSON.stringify({ text: "question", time: { created: 1 } }))
@@ -151,5 +163,59 @@ describe("adapters", () => {
     ])
     const again = await adapter.load("ses_1", new Map([["msg_1", "10"], ["msg_2", "9"]]))
     expect(again!.messages.map((message) => ("unchanged" in message ? "unchanged" : message.id))).toEqual(["unchanged", "msg_2"])
+  })
+
+  test("opencode: refresh rereads only sessions with new messages or an open turn", async () => {
+    const path = join(temp(), "opencode.db")
+    const db = opencodeDatabase(path)
+    const now = Date.now()
+    const insert = db.query("INSERT INTO session_message VALUES (?, ?, ?, ?, ?, ?, ?)")
+    const text = (words: string) => JSON.stringify({ time: { created: 1 }, content: [{ type: "text", text: words }] })
+    for (const id of ["ses_a", "ses_b"]) db.run(`INSERT INTO session_v2 VALUES (?, NULL, '/w', ?, 1, 1, NULL, NULL)`, [id, id])
+    const old = now - 3 * 86400e3
+    insert.run("a1", "ses_a", "assistant", 0, old, old, text("alpha"))
+    insert.run("a2", "ses_a", "idle", 1, old, old, "{}")
+    insert.run("b1", "ses_b", "assistant", 0, old, old, text("bravo"))
+    insert.run("b2", "ses_b", "idle", 1, old, old, "{}")
+
+    const store = new Store(":memory:")
+    const adapter = opencode("oc", path)
+    const words = (query: string) => search(store, query).results.map((result) => result.session.id)
+    expect(await store.refresh([adapter])).toBe(2) // first run: full
+    expect(await store.refresh([adapter])).toBe(0)
+
+    // A new message in one session: only that one is read again.
+    insert.run("a3", "ses_a", "assistant", 2, now, now, text("charlie"))
+    expect(await store.refresh([adapter])).toBe(1)
+    expect(words("charlie")).toEqual(["ses_a"])
+
+    // ses_a is now mid-turn (no idle after a3): its message changes without new ones, and is still picked up.
+    db.run("UPDATE session_message SET time_updated = ?, data = ? WHERE id = 'a3'", [now + 1, text("delta")])
+    expect(await store.refresh([adapter])).toBe(1)
+    expect(words("delta")).toEqual(["ses_a"])
+    expect(words("charlie")).toEqual([])
+    insert.run("a4", "ses_a", "idle", 3, now, now, "{}")
+    await store.refresh([adapter])
+    // Idle again: no longer open (it is still reread while its messages are within the last minutes' slack).
+    expect(store.db.query<{ open: number | null }, []>("SELECT open FROM session WHERE id = 'ses_a'").get()!.open).toBeNull()
+
+    // An edit to an old message of an idle session: only a full check sees it.
+    db.run("UPDATE session_message SET time_updated = ?, data = ? WHERE id = 'b1'", [now, text("echo")])
+    await store.refresh([adapter])
+    expect(words("echo")).toEqual([])
+    await store.refresh([adapter], undefined, { full: true })
+    expect(words("echo")).toEqual(["ses_b"])
+    expect(words("bravo")).toEqual([])
+
+    // A deleted message and a deleted session.
+    db.run("DELETE FROM session_message WHERE id = 'a3'")
+    insert.run("a5", "ses_a", "user", 4, now, now, JSON.stringify({ text: "foxtrot", time: { created: 1 } }))
+    await store.refresh([adapter])
+    expect(words("delta")).toEqual([])
+    expect(words("foxtrot")).toEqual(["ses_a"])
+    db.run("DELETE FROM session_message WHERE session_id = 'ses_b'")
+    db.run("DELETE FROM session_v2 WHERE id = 'ses_b'")
+    await store.refresh([adapter])
+    expect(words("echo")).toEqual([])
   })
 })

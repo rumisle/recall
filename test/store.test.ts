@@ -16,7 +16,7 @@ function fake(harness = "fake") {
   const adapter: Adapter = {
     harness,
     async list() {
-      return [...sessions.keys()].map((id) => ({ id, marker: String(markers.get(id)) }))
+      return { sessions: [...sessions.keys()].map((id) => ({ id, marker: String(markers.get(id)) })) }
     },
     async load(id) {
       const found = sessions.get(id)

@@ -19,7 +19,8 @@ const HELP = `recall: search and read past agent sessions (ocelot, opencode, Cla
       --in KINDS                                  user,assistant,reasoning,tool,call,result,system
       --max-part N (4000)                         longer parts are cut in the middle; 0 = never
   recall read SESSION --part N.I [--offset N] [--length N]   one part in full (message N, part I)
-  recall refresh               update the index (search and read do it first anyway)
+  recall refresh [--full]      update the index (search and read do it first anyway); --full also
+                               rechecks old messages (otherwise done weekly)
 
   Options: --json  --no-refresh  --db PATH (or RECALL_DB)
            --all   run from an agent, search covers only that agent's harness unless the query has agent:
@@ -55,6 +56,7 @@ const { values, positionals } = parseArgs({
     part: { type: "string" },
     length: { type: "string" },
     json: { type: "boolean" },
+    full: { type: "boolean" },
     all: { type: "boolean" },
     "no-refresh": { type: "boolean" },
     db: { type: "string" },
@@ -83,11 +85,15 @@ const store = new Store(values.db ?? process.env.RECALL_DB ?? undefined)
 if (!values["no-refresh"] || command === "refresh") {
   const started = performance.now()
   let last = 0
-  const changed = await store.refresh(defaultAdapters(), (progress) => {
-    if (!process.stderr.isTTY || values.quiet || performance.now() - last < 200) return
-    last = performance.now()
-    process.stderr.write(`\rindexing ${progress.harness} ${progress.done}/${progress.total}\x1b[K`)
-  })
+  const changed = await store.refresh(
+    defaultAdapters(),
+    (progress) => {
+      if (!process.stderr.isTTY || values.quiet || performance.now() - last < 200) return
+      last = performance.now()
+      process.stderr.write(`\rindexing ${progress.harness} ${progress.done}/${progress.total}\x1b[K`)
+    },
+    { full: values.full },
+  )
   if (process.stderr.isTTY && last) process.stderr.write("\r\x1b[K")
   if (command === "refresh" && !values.quiet) console.error(`${changed} sessions updated in ${((performance.now() - started) / 1000).toFixed(1)}s`)
 }

@@ -5,33 +5,76 @@ import { renderInput } from "./shared"
 
 // OpenCode 2 (and ocelot, which shares its schema): sessions in `session_v2`, one row per message in
 // `session_message` with the message as JSON in `data`. Read-only; the server keeps writing in WAL mode meanwhile.
+//
+// The database is large and may sit on a network filesystem, where every page read is a round trip, so a refresh
+// avoids reading message rows. Nothing indexes time_updated, and session_v2.time_updated does not follow new
+// messages, so changes are found from the time_created index instead: a session is read again when it has messages
+// created since the last refresh, or was mid-turn then (a running step updates its message without creating new
+// ones). Within it, the message list comes from covering indexes; only new messages, those created since the last
+// refresh and those of the open turn have their row read, and their data only if time_updated changed. Edits to
+// older messages (rare) are caught by a full check every week, or `recall refresh --full`.
+
+const DAY = 86400e3
+const FULL_EVERY = 7 * DAY
+// Clock differences, and writes committed after the last refresh looked although created before it.
+const SLACK = 5 * 60e3
+
+interface State {
+  /** When the last refresh began. */
+  since: number
+  /** When the last full check began. */
+  full: number
+}
 
 export function opencode(harness: string, path: string): Adapter {
   let db: Database | undefined
+  // Set by list() for the load() calls of the same refresh; undefined means compare every message.
+  let since: number | undefined
   const open = () => {
     if (db) return db
     if (!existsSync(path)) return undefined
     db = new Database(path, { readonly: true })
     db.run("PRAGMA busy_timeout = 2000")
+    db.run("PRAGMA mmap_size = 1073741824")
     return db
   }
 
   return {
     harness,
-    async list() {
+    async list(context) {
       const conn = open()
       if (!conn) return undefined
+      const started = Date.now()
+      const previous = parseState(context.state)
+      const full = context.full || !previous || started - previous.full > FULL_EVERY
+      since = full || !previous ? undefined : previous.since - SLACK
+      const recent =
+        since === undefined
+          ? undefined
+          : new Set(
+              conn
+                .query<{ id: string }, [number]>(
+                  "select distinct session_id id from session_message indexed by session_message_time_created_idx where time_created > ?",
+                )
+                .all(since)
+                .map((row) => row.id),
+            )
       const rows = conn
-        .query<{ id: string; updated: number; archived: number | null; title: string | null; last: number | null; n: number }, []>(
-          `select s.id, s.time_updated updated, s.time_archived archived, s.title,
-             (select max(m.time_updated) from session_message m where m.session_id = s.id) last,
-             (select count(*) from session_message m where m.session_id = s.id) n
-           from session_v2 s`,
+        .query<{ id: string; updated: number; archived: number | null; title: string | null }, []>(
+          "select id, time_updated updated, time_archived archived, title from session_v2",
         )
         .all()
-      return rows.map(
-        (row): Listing => ({ id: row.id, marker: [row.updated, row.archived, row.title, row.last, row.n].join(":") }),
-      )
+      const state: State = { since: started, full: full ? started : previous!.full }
+      return {
+        sessions: rows.map(
+          (row): Listing => ({
+            id: row.id,
+            marker: [row.updated, row.archived, row.title].join(":"),
+            dirty: !recent || recent.has(row.id) || context.open.has(row.id),
+          }),
+        ),
+        state: JSON.stringify(state),
+      }
     },
     async load(id, known) {
       const conn = open()
@@ -42,26 +85,43 @@ export function opencode(harness: string, path: string): Adapter {
         )
         .get(id)
       if (!row) return undefined
+      // Index-only reads: every message's id, creation time and position, and the last idle marker (turn end).
+      const positions = new Map(
+        conn
+          .query<{ r: number; seq: number }, [string]>("select rowid r, seq from session_message where session_id = ?")
+          .all(id)
+          .map((item) => [item.r, item.seq]),
+      )
       const heads = conn
-        .query<{ id: string; type: string; updated: number }, [string]>(
-          `select id, type, time_updated updated from session_message where session_id = ? order by seq`,
+        .query<{ r: number; id: string; created: number }, [string]>(
+          "select rowid r, id, time_created created from session_message where session_id = ?",
         )
         .all(id)
-      const changed = heads.filter((head) => known.get(head.id) !== String(head.updated)).map((head) => head.id)
-      const data = new Map<string, string>()
-      const select = conn.query<{ id: string; data: string }, [string]>(`select id, data from session_message where id = ?`)
-      for (const messageID of changed) {
-        const message = select.get(messageID)
-        if (message) data.set(message.id, message.data)
+        .map((item) => ({ ...item, seq: positions.get(item.r) ?? 0 }))
+        .sort((x, y) => x.seq - y.seq)
+      const idle =
+        conn
+          .query<{ seq: number | null }, [string]>("select max(seq) seq from session_message where session_id = ? and type = 'idle'")
+          .get(id)?.seq ?? -1
+      const check = heads.filter(
+        (head) => since === undefined || !known.has(head.id) || head.created > since || head.seq > idle,
+      )
+      const meta = conn.query<{ type: string; updated: number }, [string]>("select type, time_updated updated from session_message where id = ?")
+      const body = conn.query<{ data: string }, [string]>("select data from session_message where id = ?")
+      const read = new Map<string, Message>()
+      let updated = row.time_updated
+      for (const head of check) {
+        const found = meta.get(head.id)
+        if (!found) continue
+        updated = Math.max(updated, found.updated)
+        if (known.get(head.id) === String(found.updated)) continue
+        const raw = body.get(head.id)?.data
+        if (raw === undefined) continue
+        const message = toMessage(head.id, found.type, JSON.parse(raw)) ?? { id: head.id, time: head.created, role: "system", parts: [] }
+        message.marker = String(found.updated)
+        read.set(head.id, message)
       }
-      const messages = heads.flatMap((head): (Message | Unchanged)[] => {
-        const raw = data.get(head.id)
-        if (raw === undefined) return [{ id: head.id, unchanged: true }]
-        const message = toMessage(head.id, head.type, JSON.parse(raw))
-        if (!message) return []
-        message.marker = String(head.updated)
-        return [message]
-      })
+      const last = heads.at(-1)
       const model = row.model ? JSON.parse(row.model) : undefined
       const session: SessionInfo = {
         harness,
@@ -69,14 +129,30 @@ export function opencode(harness: string, path: string): Adapter {
         title: row.title ?? "",
         directory: row.directory,
         created: row.time_created,
-        updated: Math.max(row.time_updated, conn.query<{ last: number | null }, [string]>("select max(time_updated) last from session_message where session_id = ?").get(id)?.last ?? 0),
+        updated: Math.max(updated, last?.created ?? 0),
         parent: row.parent_id ?? undefined,
         archived: row.time_archived ?? undefined,
         model: model ? `${model.providerID}/${model.id}` : undefined,
         source: path,
       }
-      return { session, messages } satisfies Transcript
+      return {
+        session,
+        messages: heads.map((head): Message | Unchanged => read.get(head.id) ?? { id: head.id, unchanged: true }),
+        // Mid-turn: messages after the last idle marker, recently. A session that ended without one (a shutdown
+        // records none) stops counting after a day.
+        open: last !== undefined && last.seq > idle && last.created > Date.now() - DAY,
+      } satisfies Transcript
     },
+  }
+}
+
+function parseState(value: string | undefined): State | undefined {
+  if (!value) return undefined
+  try {
+    const parsed = JSON.parse(value)
+    return typeof parsed?.since === "number" && typeof parsed?.full === "number" ? parsed : undefined
+  } catch {
+    return undefined
   }
 }
 

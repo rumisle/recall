@@ -46,8 +46,10 @@ export interface SessionInfo {
 /** A session as listed by an adapter, before reading its messages. */
 export interface Listing {
   id: string
-  /** Changes whenever the session's content may have changed. */
+  /** Changes whenever the session's content may have changed (unless `dirty` says so instead). */
   marker: string
+  /** Load it even though the marker is unchanged. */
+  dirty?: boolean
 }
 
 /** A message the adapter did not re-read because its marker is unchanged. */
@@ -59,12 +61,29 @@ export interface Unchanged {
 export interface Transcript {
   session: SessionInfo
   messages: (Message | Unchanged)[]
+  /** It may still change without its marker changing (e.g. mid-turn); passed back to the next list() in `open`. */
+  open?: boolean
+}
+
+export interface ListContext {
+  /** What this adapter returned as `state` last time (undefined on the first run). */
+  state?: string
+  /** Check everything, not only what the adapter's shortcuts say may have changed. */
+  full: boolean
+  /** Sessions whose last load said `open`. */
+  open: Set<string>
+}
+
+export interface Listed {
+  sessions: Listing[]
+  /** Stored once the refresh of this adapter completes, and passed to the next list(). */
+  state?: string
 }
 
 export interface Adapter {
   harness: string
   /** Every session, cheaply. Undefined when the store does not exist. */
-  list(): Promise<Listing[] | undefined>
+  list(context: ListContext): Promise<Listed | undefined>
   /**
    * The session's messages, in order. `known` maps message ids already indexed to their markers; an adapter that
    * can tell a message is unchanged without parsing it may return it as Unchanged.
