@@ -1,89 +1,107 @@
 # recall
 
-Full-text search and transcript reading over past coding-agent sessions: ocelot / OpenCode 2, Claude Code, Codex
-and pi. Every part of every message is indexed (prompts, replies, reasoning, tool calls and tool results), so a
-search can land on the exact message, and a transcript can be read back in full.
+Search and read your past coding-agent sessions: OpenCode (and ocelot), Claude Code, Codex and pi, from one CLI.
 
-Two consumers:
+Everything is indexed: prompts, replies, reasoning, tool calls and tool output. A search lands on the exact message,
+and the transcript around it can be read back in full. Made for agents first ("what did we decide about X last
+week?", or recovering details after a context compaction), and pleasant enough for people.
 
-- **Agents** (any harness): `recall` CLI, `--json` for tools. Search past sessions, then read them, including the
-  agent's own session after compaction.
-- **ocelot's web app**: the library (`import { Store, search } from "recall"`) behind Cmd+K, ocelot sessions only.
+```
+$ recall "cache miss in:reasoning"
+4 sessions · 12 ms
 
-## Requirements
+1. Prompt cache warmer
+   ses_4f2a91 · opencode · ~/work/proxy · 2d ago · 214 messages
+   #57 thinking  …the 7-minute idle gap explains the «cache» «miss»: the TTL is 5 minutes, so…
+   #61 assistant  Every «cache» «miss» after an idle gap now logs the gap and the tokens it cost.
 
-Search (shared):
-- Indexes titles, directories, user, assistant, reasoning, tool calls (input) and tool results; a hit names the
-  session, message and part.
-- Forgiving like fast-resume: prefixes and one-typo variants match, recent sessions rank higher, filter syntax
-  `agent:` `dir:` `date:`. Strict about accuracy: exact matches rank above prefix/typo matches, and a highlight is
-  exactly what matched (same tokenizer and rules for both).
-- CJK, code, paths and identifiers all searchable (`需求`, `CommandPalette` by `palette`, `foo_bar` by `bar`).
-- Archived sessions included but ranked lower; subagent / worker sessions included; both filterable.
-- Fast: every keystroke; new messages searchable right away (a refresh before each search takes milliseconds).
+2. ...
 
-Agent tool:
-- Every harness, every directory, archived and child sessions; filters narrow it down.
-- Read any transcript in full: message ranges, around a hit, by kind; long parts cut with a way to read them whole.
+$ recall read ses_4f2a91 --around 57 --context 1
+▌assistant #56 · 14:02
+▶ shell $ grep -c cache_read logs/requests.jsonl
+✓ 118
 
-Web (ocelot integration, not here): Cmd+K searches content, not files; results grouped by session with highlighted
-excerpts; opening one jumps to the matching message.
+▌assistant #57 · 14:03
+┆ the 7-minute idle gap explains the cache miss: the TTL is 5 minutes, so…
+```
+
+## Install
+
+Needs [Bun](https://bun.sh) (prebuilt binaries are planned).
+
+```bash
+git clone https://github.com/rumisle/recall && cd recall && bun install
+ln -s "$PWD/src/cli.ts" ~/.local/bin/recall
+recall refresh    # first index: about a minute for a large history; afterwards it keeps itself current
+```
+
+For agents, add a skill or instruction telling them recall exists, e.g. "Use `recall` to search and read past
+sessions: search first, then `recall read <id> --around <#>`; run `recall --help` for the syntax."
 
 ## Usage
 
 ```bash
-recall "cache miss in:reasoning date:<2w"     # search (refreshes the index first)
-recall read ses_4f2a91 --around 81 --context 3
-recall read ses_4f2a91 --from -10 --in user,assistant
-recall read ses_4f2a91 --part 81.2             # one part, whole
-recall read self --from -20                   # the calling agent's own session
-recall refresh
-recall --help
+recall "auth middleware"                  # sessions, best match first, with highlighted excerpts
+recall "in:title quarterly report"        # by title
+recall read ses_4f2a91 --around 81        # messages around a hit (#81)
+recall read ses_4f2a91 --from -20         # the last 20 messages
+recall read ses_4f2a91 --in user,assistant
+recall read ses_4f2a91 --part 81.2        # one part in full (long parts are cut, and say so)
+recall read self --from -30               # the calling agent's own session
 ```
 
-Sessions are printed by their shortest unique id prefix (8+ characters; `harness:` in front when the same id is in
-two stores); `read` and `session:` take any unique prefix.
+Every command takes `--json`. Sessions are shown by their shortest unique id prefix; `read` takes any unique
+prefix.
 
-Run from inside an agent, recall finds the agent's harness and session from the variables each harness sets for its
-commands (`OPENCODE_SESSION_ID`, `PI_SESSION_ID`, `CODEX_THREAD_ID`, `CLAUDECODE`). Searches then cover only that
-harness unless the query names `agent:` or `--all` is given, and `self` / `session:self` mean its own session.
+**Inside an agent**, recall detects which harness and session it runs in (from `OPENCODE_SESSION_ID`,
+`PI_SESSION_ID`, `CODEX_THREAD_ID`, `CLAUDECODE`). It then searches only that harness unless the query has `agent:` or
+`--all` is given, and `self` means the agent's own session.
 
-Query syntax:
+### Query syntax
 
 | | |
 |---|---|
-| `words` | all must appear; words of 3+ letters also match as prefixes, and rare words with one typo |
-| `"exact phrase"` | in order, no prefixes or typos |
+| `words` | all must appear; words of 3+ letters also match as prefixes, rare words with one typo |
+| `"exact phrase"` | in order, nothing fuzzy |
 | `-word` | leave out sessions containing it |
-| `agent:claude,codex` `-agent:pi` `agent:!pi` | harness: `ocelot` `opencode` `claude` `codex` `pi` |
-| `dir:backend,!test` | directory contains (case-insensitive) |
+| `agent:claude,codex` `-agent:pi` | harness: `opencode` `ocelot` `claude` `codex` `pi` |
+| `dir:backend,!test` | working directory contains |
 | `date:<2d` `date:>1w` `today` `yesterday` `week` `month` | last activity; units `m h d w mo y` |
-| `in:user,reasoning` `-in:tool` | parts: `user assistant reasoning tool call result system title` |
+| `in:user,reasoning` `-in:tool` | `user assistant reasoning tool call result system title` |
 | `is:archived` `-is:child` | archived / subagent sessions only, or none |
-| `session:ID` | within one session (id prefix) |
+| `session:ID` | within one session |
+
+Exact matches always rank above prefix and typo matches; among those, recent sessions rank higher. Highlights show
+exactly what matched. Chinese, Japanese and Korean text matches as exact substrings; identifiers match by their
+parts (`palette` finds `CommandPalette`).
+
+## Where it reads from
+
+| Harness | Location |
+|---|---|
+| OpenCode 2 | `~/.local/share/opencode/opencode*.db` (each channel's database, e.g. `opencode-ocelot.db` as `ocelot`) |
+| Claude Code | `~/.claude/projects/**/*.jsonl`, including subagents |
+| Codex | `~/.codex/sessions/**/*.jsonl` (reasoning is encrypted; only its summaries are readable) |
+| pi | `~/.pi/agent/sessions/**/*.jsonl` (or `PI_CODING_AGENT_DIR` / `PI_CODING_AGENT_SESSION_DIR`) |
+
+All stores are read-only. The index is a local SQLite file, `~/.cache/recall/index.db` (`RECALL_DB` to move it); it
+holds a copy of your transcripts, so treat it like them. Nothing leaves the machine.
 
 ## How it works
 
-- **Adapters** (`src/adapters`) read each store into one model (session, messages, parts). OpenCode-family databases
-  (`opencode*.db`, ocelot's is `opencode-ocelot.db`) are read with SQLite, read-only; the rest are JSONL files.
-- **Index** (`src/store.ts`): one SQLite file at `~/.cache/recall/index.db`. One row per part in `entry` (text
-  zstd-compressed when long) and one FTS5 document per part (plus one per session title). The rowid encodes session
-  and kind, so search groups and filters on the FTS table alone. Refresh compares cheap per-session markers (mtime and
-  size; for OpenCode, update times), and per-message markers or content hashes, so only changed messages are
-  rewritten. Concurrent refreshers (the server and CLI calls) re-check inside an IMMEDIATE transaction.
-- **Tokenizer** (`src/tokenize.ts`): letters/digits runs, lowercased, accents removed; each CJK character a token (a
-  CJK word is a phrase, i.e. an exact substring); identifiers also yield their parts. Text is tokenized in JS and
-  FTS5 only splits on spaces, so the index, query and highlighter agree exactly.
-- **Search** (`src/search.ts`): per term an FTS5 expression of the exact phrase, a prefix (unless the word itself is
-  common) and typo variants (only for rare words: index words one edit or swap away, most frequent first). Strict
-  tiers: every term exactly in one part; in one part with prefixes/typos; spread over parts. Within a tier: bm25 of the
-  best part (skipped above 20k matching parts, where it dominates the cost) and number of matching parts, times
-  fast-resume's recency curve (x2.5 today, x1.75 at two weeks), halved when archived. The grouping pass also collects
-  which parts to show, so hits never re-run the match. Forks (same opening, same hit at the same position) fold into
-  the better-ranked session as `copies`.
+- **Index**: SQLite FTS5, one document per part of a message. Before each command, recall compares cheap change
+  markers (file size and time, database update times) and re-reads only changed messages, which takes milliseconds.
+- **Tokenizer**: one tokenizer for indexing, querying and highlighting, so they always agree. Each CJK character is a
+  token (a CJK word is an exact phrase); identifiers also yield their parts.
+- **Ranking**: three strict tiers (all words exactly in one part; with prefixes or typos; spread over several parts),
+  then bm25 and the number of matches, times a recency boost (x2.5 today, x1.75 at two weeks), lower for archived
+  sessions. Forked sessions that share a match are folded into one result.
 
-On a history of 1.7k sessions (540M characters): cold build 46 s, index 630 MB;
-no-op refresh ~20 ms; searches 3–20 ms, ~35 ms for words in 100k+ parts; a CLI call end to end 50–90 ms.
+On a history of 1.7k sessions (540M characters): first index 46 s and 630 MB; searches 3–35 ms; a CLI call, index
+check included, 50–90 ms.
+
+Inspired by [fast-resume](https://github.com/angristan/fast-resume).
 
 ## Development
 
