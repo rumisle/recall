@@ -28,13 +28,16 @@ $ recall read ses_4f2a91 --around 57 --context 1
 
 ## Install
 
-Needs [Bun](https://bun.sh) (prebuilt binaries are planned).
+macOS and Linux (x64 and ARM), one binary, no dependencies:
 
 ```bash
-git clone https://github.com/rumisle/recall && cd recall && bun install
-ln -s "$PWD/src/cli.ts" ~/.local/bin/recall
+curl -fsSL https://github.com/rumisle/recall/releases/latest/download/install | bash
 recall refresh    # first index: about a minute for a large history; afterwards it keeps itself current
 ```
+
+It installs to `~/.local/bin` (`RECALL_INSTALL_DIR` to change); run the same line again to update, or add
+`-s -- --version 0.1.0` after `bash` for a given version. From source, with [Bun](https://bun.sh):
+`bun install`, then run `src/cli.ts`.
 
 For agents, add a skill or instruction telling them recall exists, e.g. "Use `recall` to search and read past
 sessions: search first, then `recall read <id> --around <#>`; run `recall --help` for the syntax."

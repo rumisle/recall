@@ -1,0 +1,43 @@
+name: release
+# Tests on every push and pull request; on main, publishes a release when package.json's version is new.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: 1.3.11 }
+      - run: bun install --frozen-lockfile
+      - run: bun test
+      - run: bunx tsc --noEmit -p .
+      - id: version
+        if: github.ref == 'refs/heads/main'
+        run: |
+          v=$(jq -r .version package.json)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if gh release view "v$v" >/dev/null 2>&1; then echo "exists=1" >> "$GITHUB_OUTPUT"; fi
+      - if: github.ref == 'refs/heads/main' && !steps.version.outputs.exists
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          scripts/build.sh
+          prev=$(gh release list --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
+          {
+            echo 'Install or update: `curl -fsSL https://github.com/rumisle/recall/releases/latest/download/install | bash`'
+            if [ -n "$prev" ]; then
+              echo
+              echo "### Changes since $prev"
+              git log --format='- %s' "$prev..HEAD"
+            fi
+          } > notes.md
+          gh release create "v$VERSION" dist/*.tar.gz dist/install --title "recall $VERSION" --notes-file notes.md --target "$GITHUB_SHA"

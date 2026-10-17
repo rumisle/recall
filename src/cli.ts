@@ -7,6 +7,7 @@ import { caller, shortIds } from "./ids"
 import { read, readPart } from "./read"
 import { search } from "./search"
 import { Store } from "./store"
+import pkg from "../package.json"
 
 const HELP = `recall: search and read past agent sessions (ocelot, opencode, Claude Code, Codex, pi)
 
@@ -59,6 +60,7 @@ const { values, positionals } = parseArgs({
     db: { type: "string" },
     quiet: { type: "boolean", short: "q" },
     help: { type: "boolean", short: "h" },
+    version: { type: "boolean", short: "v" },
   },
 })
 
@@ -66,6 +68,11 @@ const number = (value: string | undefined) => (value === undefined ? undefined :
 const color = process.stdout.isTTY && !process.env.NO_COLOR
 
 const [command, ...rest] = ["search", "read", "refresh", "help"].includes(positionals[0] ?? "") ? positionals : ["search", ...positionals]
+
+if (values.version) {
+  console.log(`recall ${pkg.version}`)
+  process.exit(0)
+}
 
 if (values.help || command === "help") {
   console.log(HELP)
