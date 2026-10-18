@@ -38,6 +38,15 @@ export function defaultPath() {
   return join(cache, "recall", "index.db")
 }
 
+export interface Report {
+  harness: string
+  /** Sessions in the store, read again, and gone. */
+  sessions: number
+  reread: number
+  removed: number
+  ms: number
+}
+
 export interface Progress {
   harness: string
   done: number
@@ -104,14 +113,21 @@ export class Store {
    * Bring the index up to date with every adapter's store. Returns the number of sessions read again. `full` makes
    * adapters check everything instead of only what their shortcuts say may have changed.
    */
-  async refresh(adapters: Adapter[], onProgress?: (progress: Progress) => void, options: { full?: boolean } = {}) {
+  async refresh(adapters: Adapter[], onProgress?: (progress: Progress) => void, options: { full?: boolean; report?: (report: Report) => void } = {}) {
     let changed = 0
     for (const adapter of adapters) {
+      const started = performance.now()
       const state = this.db.query<{ value: string }, [string]>("SELECT value FROM state WHERE harness = ?").get(adapter.harness)?.value
       const open = new Set(
         this.db.query<{ id: string }, [string]>("SELECT id FROM session WHERE harness = ? AND open = 1").all(adapter.harness).map((row) => row.id),
       )
-      const listed = await adapter.list({ state, full: options.full ?? false, open })
+      const indexedTimes = new Map(
+        this.db
+          .query<{ id: string; updated: number }, [string]>("SELECT id, updated FROM session WHERE harness = ?")
+          .all(adapter.harness)
+          .map((row) => [row.id, row.updated]),
+      )
+      const listed = await adapter.list({ state, full: options.full ?? false, open, indexed: indexedTimes })
       if (!listed) continue
       const listing = listed.sessions
       const listedIDs = new Set(listing.map((item) => item.id))
@@ -146,6 +162,7 @@ export class Store {
         onProgress?.({ harness: adapter.harness, done, total: stale.length })
       }
       changed += stale.length + gone.length
+      options.report?.({ harness: adapter.harness, sessions: listing.length, reread: stale.length, removed: gone.length, ms: performance.now() - started })
       if (listed.state !== undefined)
         this.db.run("INSERT INTO state (harness, value) VALUES (?, ?) ON CONFLICT (harness) DO UPDATE SET value = excluded.value", [adapter.harness, listed.state])
     }

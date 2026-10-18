@@ -92,7 +92,14 @@ if (!values["no-refresh"] || command === "refresh") {
       last = performance.now()
       process.stderr.write(`\rindexing ${progress.harness} ${progress.done}/${progress.total}\x1b[K`)
     },
-    { full: values.full },
+    {
+      full: values.full,
+      report: (report) => {
+        if (command !== "refresh" || values.quiet) return
+        if (process.stderr.isTTY) process.stderr.write("\r\x1b[K")
+        console.error(`${report.harness.padEnd(9)} ${String(report.sessions).padStart(5)} sessions · ${report.reread} read again${report.removed ? ` · ${report.removed} gone` : ""} · ${(report.ms / 1000).toFixed(2)}s`)
+      },
+    },
   )
   if (process.stderr.isTTY && last) process.stderr.write("\r\x1b[K")
   if (command === "refresh" && !values.quiet) console.error(`${changed} sessions updated in ${((performance.now() - started) / 1000).toFixed(1)}s`)

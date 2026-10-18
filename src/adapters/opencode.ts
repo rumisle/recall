@@ -28,8 +28,9 @@ interface State {
 
 export function opencode(harness: string, path: string): Adapter {
   let db: Database | undefined
-  // Set by list() for the load() calls of the same refresh; undefined means compare every message.
-  let since: number | undefined
+  // Set by list() for the load() calls of the same refresh: per session, messages created after this may have changed.
+  // Undefined: compare every message.
+  let since: ((id: string) => number) | undefined
   const open = () => {
     if (db) return db
     if (!existsSync(path)) return undefined
@@ -46,25 +47,35 @@ export function opencode(harness: string, path: string): Adapter {
       if (!conn) return undefined
       const started = Date.now()
       const previous = parseState(context.state)
-      const full = context.full || !previous || started - previous.full > FULL_EVERY
-      since = full || !previous ? undefined : previous.since - SLACK
-      const recent =
-        since === undefined
-          ? undefined
-          : new Set(
-              conn
-                .query<{ id: string }, [number]>(
-                  "select distinct session_id id from session_message indexed by session_message_time_created_idx where time_created > ?",
-                )
-                .all(since)
-                .map((row) => row.id),
-            )
+      const full = context.full || (!previous && !context.indexed.size) || (previous !== undefined && started - previous.full > FULL_EVERY)
       const rows = conn
         .query<{ id: string; updated: number; archived: number | null; title: string | null }, []>(
           "select id, time_updated updated, time_archived archived, title from session_v2",
         )
         .all()
-      const state: State = { since: started, full: full ? started : previous!.full }
+      let recent: Set<string> | undefined
+      if (full) since = undefined
+      else if (previous) {
+        const after = previous.since - SLACK
+        since = () => after
+        recent = new Set(
+          conn
+            .query<{ id: string }, [number]>(
+              "select distinct session_id id from session_message indexed by session_message_time_created_idx where time_created > ?",
+            )
+            .all(after)
+            .map((row) => row.id),
+        )
+      } else {
+        // An index but no state (recall was updated, or a refresh was interrupted): compare each session's newest
+        // message with when that session was last indexed. One index lookup per session.
+        const indexed = context.indexed
+        since = (id) => (indexed.get(id) ?? 0) - SLACK
+        const newest = conn.query<{ created: number | null }, [string]>("select max(time_created) created from session_message where session_id = ?")
+        // Both times come from the database, so no slack for clocks here.
+        recent = new Set(rows.filter((row) => !indexed.has(row.id) || (newest.get(row.id)?.created ?? 0) > indexed.get(row.id)!).map((row) => row.id))
+      }
+      const state: State = { since: started, full: full || !previous ? started : previous.full }
       return {
         sessions: rows.map(
           (row): Listing => ({
@@ -85,37 +96,36 @@ export function opencode(harness: string, path: string): Adapter {
         )
         .get(id)
       if (!row) return undefined
-      // Index-only reads: every message's id, creation time and position, and the last idle marker (turn end).
-      const positions = new Map(
-        conn
-          .query<{ r: number; seq: number }, [string]>("select rowid r, seq from session_message where session_id = ?")
-          .all(id)
-          .map((item) => [item.r, item.seq]),
-      )
-      const heads = conn
-        .query<{ r: number; id: string; created: number }, [string]>(
-          "select rowid r, id, time_created created from session_message where session_id = ?",
-        )
-        .all(id)
-        .map((item) => ({ ...item, seq: positions.get(item.r) ?? 0 }))
-        .sort((x, y) => x.seq - y.seq)
+      // Full check: one ordered pass over the session's rows. Otherwise index-only reads (every message's id,
+      // creation time and position, and the last idle marker) and rows only for messages that may have changed.
+      const heads: Head[] =
+        since === undefined
+          ? conn
+              .query<Head, [string]>(
+                "select rowid r, id, seq, time_created created, type, time_updated updated from session_message where session_id = ? order by seq",
+              )
+              .all(id)
+          : indexedHeads(conn, id)
       const idle =
-        conn
-          .query<{ seq: number | null }, [string]>("select max(seq) seq from session_message where session_id = ? and type = 'idle'")
-          .get(id)?.seq ?? -1
+        since === undefined
+          ? (heads.findLast((head) => head.type === "idle")?.seq ?? -1)
+          : (conn
+              .query<{ seq: number | null }, [string]>("select max(seq) seq from session_message where session_id = ? and type = 'idle'")
+              .get(id)?.seq ?? -1)
+      const after = since?.(id)
       const check = heads.filter(
-        (head) => since === undefined || !known.has(head.id) || head.created > since || head.seq > idle,
+        (head) => after === undefined || !known.has(head.id) || head.created > after || head.seq > idle,
       )
-      const meta = conn.query<{ type: string; updated: number }, [string]>("select type, time_updated updated from session_message where id = ?")
-      const body = conn.query<{ data: string }, [string]>("select data from session_message where id = ?")
+      const meta = conn.query<{ type: string; updated: number }, [number]>("select type, time_updated updated from session_message where rowid = ?")
+      const body = conn.query<{ data: string }, [number]>("select data from session_message where rowid = ?")
       const read = new Map<string, Message>()
       let updated = row.time_updated
       for (const head of check) {
-        const found = meta.get(head.id)
+        const found = head.type !== undefined && head.updated !== undefined ? { type: head.type, updated: head.updated } : meta.get(head.r)
         if (!found) continue
         updated = Math.max(updated, found.updated)
         if (known.get(head.id) === String(found.updated)) continue
-        const raw = body.get(head.id)?.data
+        const raw = body.get(head.r)?.data
         if (raw === undefined) continue
         const message = toMessage(head.id, found.type, JSON.parse(raw)) ?? { id: head.id, time: head.created, role: "system", parts: [] }
         message.marker = String(found.updated)
@@ -144,6 +154,31 @@ export function opencode(harness: string, path: string): Adapter {
       } satisfies Transcript
     },
   }
+}
+
+interface Head {
+  r: number
+  id: string
+  seq: number
+  created: number
+  /** Known only from a full pass. */
+  type?: string
+  updated?: number
+}
+
+// Two covering indexes, joined on rowid: (session_id, seq) and (session_id, time_created, id).
+function indexedHeads(conn: Database, id: string): Head[] {
+  const positions = new Map(
+    conn
+      .query<{ r: number; seq: number }, [string]>("select rowid r, seq from session_message where session_id = ?")
+      .all(id)
+      .map((item) => [item.r, item.seq]),
+  )
+  return conn
+    .query<{ r: number; id: string; created: number }, [string]>("select rowid r, id, time_created created from session_message where session_id = ?")
+    .all(id)
+    .map((item) => ({ ...item, seq: positions.get(item.r) ?? 0 }))
+    .sort((x, y) => x.seq - y.seq)
 }
 
 function parseState(value: string | undefined): State | undefined {

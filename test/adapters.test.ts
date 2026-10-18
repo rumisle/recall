@@ -29,7 +29,7 @@ const temp = () => mkdtempSync(join(tmpdir(), "recall-"))
 const jsonl = (lines: unknown[]) => lines.map((line) => JSON.stringify(line)).join("\n") + "\n"
 
 async function loadOnly(adapter: Adapter) {
-  const listing = (await adapter.list({ full: false, open: new Set() }))?.sessions
+  const listing = (await adapter.list({ full: false, open: new Set(), indexed: new Map() }))?.sessions
   expect(listing).toHaveLength(1)
   const transcript = await adapter.load(listing![0]!.id, new Map())
   return transcript!
@@ -206,6 +206,14 @@ describe("adapters", () => {
     await store.refresh([adapter], undefined, { full: true })
     expect(words("echo")).toEqual(["ses_b"])
     expect(words("bravo")).toEqual([])
+
+    // No saved state (recall updated, or a refresh interrupted): each session against its own indexed time.
+    store.db.run("DELETE FROM state")
+    expect(await store.refresh([adapter])).toBe(0)
+    insert.run("b3", "ses_b", "user", 2, now + 1000, now + 1000, JSON.stringify({ text: "golf", time: { created: 1 } }))
+    store.db.run("DELETE FROM state")
+    expect(await store.refresh([adapter])).toBe(1)
+    expect(words("golf")).toEqual(["ses_b"])
 
     // A deleted message and a deleted session.
     db.run("DELETE FROM session_message WHERE id = 'a3'")

@@ -72,6 +72,8 @@ export interface ListContext {
   full: boolean
   /** Sessions whose last load said `open`. */
   open: Set<string>
+  /** This adapter's indexed sessions and their `updated` times. */
+  indexed: Map<string, number>
 }
 
 export interface Listed {
